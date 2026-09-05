@@ -1,0 +1,8 @@
+tempo:
+  storage:
+    trace:
+      backend: local
+  retention: 24h
+persistence:
+  enabled: true
+  size: 1Gi

@@ -1,0 +1,26 @@
+prometheus:
+  prometheusSpec:
+    retention: 5d
+    enableRemoteWriteReceiver: true
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 250m
+      limits:
+        memory: 1Gi
+grafana:
+  adminPassword: "changeme"   # replace with External Secrets in Phase 4
+  persistence:
+    enabled: true
+    size: 1Gi
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: http://loki-gateway.observability.svc.cluster.local
+      access: proxy
+    - name: Tempo
+      type: tempo
+      url: http://tempo.observability.svc.cluster.local:3100
+      access: proxy
+alertmanager:
+  enabled: true

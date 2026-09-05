@@ -1,0 +1,41 @@
+.idea
+
+.idea/
+.idea
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# IDE / editor
+.idea
+.vscode
+*.iml
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Kubernetes / kubeconfig
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Helm
+charts/*.tgz
+*.tgz
+Chart.lock
+
+# Secrets / local overrides — never commit real credentials
+*.env
+.env*
+secrets.yaml
+secrets.yml
+*-secret.yaml
+*.pem
+*.key
+values.local.yaml
+values.override.yaml

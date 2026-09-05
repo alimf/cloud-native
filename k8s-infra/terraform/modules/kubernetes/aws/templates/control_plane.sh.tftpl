@@ -1,0 +1,572 @@
+#!/bin/bash
+#
+# Kubernetes Control Plane Bootstrap
+#
+# Rendered by Terraform templatefile().
+#
+# Expected Terraform variables:
+#   cluster_name
+#   kubernetes_version
+#   calico_version
+#   api_server_endpoint
+#   pod_cidr
+#   service_cidr
+#   aws_region
+#   ssm_join_command_path
+#
+
+set -Eeuo pipefail
+
+# -------------------------------------------------------------------
+# Logging / error handling
+# -------------------------------------------------------------------
+
+LOG_FILE="/var/log/k8s-control-plane-bootstrap.log"
+
+exec > >(tee -a "$${LOG_FILE}") 2>&1
+
+trap 'echo "[bootstrap][ERROR] Failed at line $${LINENO}: $${BASH_COMMAND}"' ERR
+
+echo "============================================================"
+echo "[bootstrap] Kubernetes control plane bootstrap started"
+echo "[bootstrap] Time: $(date)"
+echo "============================================================"
+
+# -------------------------------------------------------------------
+# Terraform-injected variables
+# -------------------------------------------------------------------
+
+CLUSTER_NAME="${cluster_name}"
+K8S_VERSION="${kubernetes_version}"
+CALICO_VERSION="${calico_version}"
+API_ENDPOINT="${api_server_endpoint}"
+POD_CIDR="${pod_cidr}"
+SERVICE_CIDR="${service_cidr}"
+AWS_REGION="${aws_region}"
+SSM_PATH="${ssm_join_command_path}"
+
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
+
+CONTAINERD_CONFIG="/etc/containerd/config.toml"
+KUBEADM_CONFIG="/etc/kubeadm-config.yaml"
+
+KUBE_APT_KEYRING="/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+DOCKER_APT_KEYRING="/etc/apt/keyrings/docker.gpg"
+
+MAX_RETRIES=30
+RETRY_INTERVAL=10
+
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
+
+log() {
+    echo "[bootstrap] $1"
+}
+error() {
+    echo "[bootstrap][ERROR] $1" >&2
+    exit 1
+}
+retry() {
+    local description="$1"
+    shift
+
+    local attempt=1
+
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+
+        if (( attempt >= MAX_RETRIES )); then
+            error "$${description} failed after $${MAX_RETRIES} attempts"
+        fi
+
+        log "$${description} failed; retrying in $${RETRY_INTERVAL}s ($${attempt}/$${MAX_RETRIES})"
+
+        sleep "$${RETRY_INTERVAL}"
+
+        ((attempt++))
+    done
+}
+
+# -------------------------------------------------------------------
+# Validate Terraform variables
+# -------------------------------------------------------------------
+
+log "Validating configuration"
+
+[[ -n "$${CLUSTER_NAME}" ]]       || error "CLUSTER_NAME is empty"
+[[ -n "$${K8S_VERSION}" ]]        || error "K8S_VERSION is empty"
+[[ -n "$${CALICO_VERSION}" ]]     || error "CALICO_VERSION is empty"
+[[ -n "$${API_ENDPOINT}" ]]       || error "API_ENDPOINT is empty"
+[[ -n "$${POD_CIDR}" ]]           || error "POD_CIDR is empty"
+[[ -n "$${SERVICE_CIDR}" ]]       || error "SERVICE_CIDR is empty"
+[[ -n "$${AWS_REGION}" ]]         || error "AWS_REGION is empty"
+[[ -n "$${SSM_PATH}" ]]           || error "SSM_PATH is empty"
+
+log "Cluster name: $${CLUSTER_NAME}"
+log "Kubernetes version: $${K8S_VERSION}"
+log "Calico version: $${CALICO_VERSION}"
+log "API endpoint: $${API_ENDPOINT}"
+log "Pod CIDR: $${POD_CIDR}"
+log "Service CIDR: $${SERVICE_CIDR}"
+log "AWS region: $${AWS_REGION}"
+log "SSM path: $${SSM_PATH}"
+
+# -------------------------------------------------------------------
+# Detect primary network interface and private IP
+# -------------------------------------------------------------------
+
+log "Detecting node network configuration"
+
+PRIMARY_INTERFACE=$(ip -4 route show default | awk 'NR==1 {print $5}')
+
+[[ -n "$${PRIMARY_INTERFACE}" ]] \
+    || error "Unable to determine primary network interface"
+
+NODE_IP=$(
+    ip -4 addr show dev "$${PRIMARY_INTERFACE}" \
+    | awk '/inet / {print $2}' \
+    | cut -d/ -f1 \
+    | head -n1
+)
+
+[[ -n "$${NODE_IP}" ]] \
+    || error "Unable to determine node private IP"
+
+log "Primary interface: $${PRIMARY_INTERFACE}"
+log "Node private IP: $${NODE_IP}"
+
+# -------------------------------------------------------------------
+# System prerequisites
+# -------------------------------------------------------------------
+
+log "Disabling swap"
+
+swapoff -a
+
+# Comment swap entries in fstab.
+sed -i '/[[:space:]]swap[[:space:]]/ s/^[^#]/#&/' /etc/fstab
+
+
+# -------------------------------------------------------------------
+# Kernel modules
+# -------------------------------------------------------------------
+
+log "Configuring Kubernetes kernel modules"
+
+cat > /etc/modules-load.d/k8s.conf <<'MODULES'
+overlay
+br_netfilter
+MODULES
+
+modprobe overlay
+modprobe br_netfilter
+
+# -------------------------------------------------------------------
+# Kernel networking parameters
+# -------------------------------------------------------------------
+
+log "Configuring Kubernetes networking sysctl settings"
+
+cat > /etc/sysctl.d/99-kubernetes.conf <<'SYSCTL'
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTL
+
+sysctl --system
+
+# -------------------------------------------------------------------
+# Required system packages
+# -------------------------------------------------------------------
+
+log "Installing required system packages"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+
+apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    software-properties-common \
+    conntrack \
+    socat \
+    iptables \
+    awscli
+
+# -------------------------------------------------------------------
+# Verify AWS CLI
+# -------------------------------------------------------------------
+
+log "Verifying AWS CLI"
+
+command -v aws >/dev/null 2>&1 \
+    || error "AWS CLI is not installed"
+
+aws --version
+
+# -------------------------------------------------------------------
+# Install containerd
+# -------------------------------------------------------------------
+
+log "Installing containerd"
+
+install -m 0755 -d /etc/apt/keyrings
+
+if [[ ! -f "$${DOCKER_APT_KEYRING}" ]]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o "$${DOCKER_APT_KEYRING}"
+
+    chmod a+r "$${DOCKER_APT_KEYRING}"
+fi
+
+UBUNTU_CODENAME=$(. /etc/os-release && echo "$${UBUNTU_CODENAME:-$${VERSION_CODENAME}}")
+
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=$${DOCKER_APT_KEYRING}] https://download.docker.com/linux/ubuntu $${UBUNTU_CODENAME} stable
+EOF
+
+apt-get update -y
+
+apt-get install -y containerd.io
+
+# -------------------------------------------------------------------
+# Configure containerd
+# -------------------------------------------------------------------
+
+log "Configuring containerd"
+
+mkdir -p /etc/containerd
+
+containerd config default > "$${CONTAINERD_CONFIG}"
+
+# Kubernetes requires systemd cgroups when using kubelet's systemd
+# cgroup driver.
+sed -i \
+    's/SystemdCgroup = false/SystemdCgroup = true/' \
+    "$${CONTAINERD_CONFIG}"
+
+systemctl daemon-reload
+
+systemctl enable containerd
+systemctl restart containerd
+
+# -------------------------------------------------------------------
+# Verify containerd
+# -------------------------------------------------------------------
+
+log "Verifying containerd"
+
+systemctl is-active --quiet containerd \
+    || error "containerd is not running"
+
+containerd config dump \
+    | grep -q 'SystemdCgroup = true' \
+    || error "containerd SystemdCgroup is not enabled"
+
+log "containerd is running with systemd cgroups"
+
+# -------------------------------------------------------------------
+# Install Kubernetes packages
+# -------------------------------------------------------------------
+
+log "Installing Kubernetes $${K8S_VERSION}"
+
+K8S_MINOR=$(echo "$${K8S_VERSION}" | cut -d. -f1,2)
+
+install -m 0755 -d /etc/apt/keyrings
+
+# Kubernetes repository key
+if [[ ! -f "$${KUBE_APT_KEYRING}" ]]; then
+
+    curl -fsSL \
+        "https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/Release.key" \
+        | gpg --dearmor -o "$${KUBE_APT_KEYRING}"
+
+    chmod a+r "$${KUBE_APT_KEYRING}"
+fi
+
+# Kubernetes repository
+cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
+deb [signed-by=$${KUBE_APT_KEYRING}] https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/ /
+EOF
+
+apt-get update -y
+
+# Install the requested Kubernetes version.
+apt-get install -y \
+    "kubelet=$${K8S_VERSION}-*" \
+    "kubeadm=$${K8S_VERSION}-*" \
+    "kubectl=$${K8S_VERSION}-*"
+
+# Prevent unattended upgrades from changing Kubernetes versions.
+apt-mark hold kubelet kubeadm kubectl
+
+systemctl enable kubelet
+
+# -------------------------------------------------------------------
+# Verify Kubernetes binaries
+# -------------------------------------------------------------------
+
+log "Verifying Kubernetes binaries"
+
+kubeadm version
+kubectl version --client
+kubelet --version
+
+# -------------------------------------------------------------------
+# Validate API endpoint
+# -------------------------------------------------------------------
+
+log "Validating Kubernetes API endpoint"
+
+if [[ "$${API_ENDPOINT}" == http://* || "$${API_ENDPOINT}" == https://* ]]; then
+    error "api_server_endpoint must not include http:// or https://"
+fi
+
+if [[ "$${API_ENDPOINT}" == *:* ]]; then
+    log "API endpoint appears to contain a port already"
+
+    # We expect API_ENDPOINT to be host/IP only.
+    # IPv6 endpoints require special handling and are not expected here.
+    error "api_server_endpoint should contain only hostname/IP, without :6443"
+fi
+
+log "API endpoint: $${API_ENDPOINT}:6443"
+
+# -------------------------------------------------------------------
+# Create kubeadm configuration
+# -------------------------------------------------------------------
+
+log "Generating kubeadm configuration"
+
+cat > "$${KUBEADM_CONFIG}" <<KUBEADM
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+
+localAPIEndpoint:
+  advertiseAddress: "$${NODE_IP}"
+  bindPort: 6443
+
+nodeRegistration:
+  criSocket: unix:///run/containerd/containerd.sock
+  kubeletExtraArgs:
+    - name: "node-ip"
+      value: "$${NODE_IP}"
+
+---
+
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: "$${CLUSTER_NAME}"
+kubernetesVersion: "v$${K8S_VERSION}"
+controlPlaneEndpoint: "$${API_ENDPOINT}:6443"
+
+networking:
+  podSubnet: "$${POD_CIDR}"
+  serviceSubnet: "$${SERVICE_CIDR}"
+
+---
+
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+
+cgroupDriver: systemd
+KUBEADM
+
+chmod 600 "$${KUBEADM_CONFIG}"
+
+# -------------------------------------------------------------------
+# kubeadm preflight
+# -------------------------------------------------------------------
+
+log "Running kubeadm preflight checks"
+
+kubeadm init phase preflight \
+    --config "$${KUBEADM_CONFIG}"
+
+# -------------------------------------------------------------------
+# Initialize Kubernetes control plane
+# -------------------------------------------------------------------
+
+log "Initializing Kubernetes control plane"
+
+kubeadm init \
+    --config "$${KUBEADM_CONFIG}" \
+    --upload-certs
+
+# -------------------------------------------------------------------
+# Configure kubectl for root
+# -------------------------------------------------------------------
+
+log "Configuring kubectl for root"
+
+mkdir -p /root/.kube
+
+cp -f /etc/kubernetes/admin.conf /root/.kube/config
+
+chmod 600 /root/.kube/config
+
+# -------------------------------------------------------------------
+# Configure kubectl for Ubuntu user
+# -------------------------------------------------------------------
+
+if id ubuntu >/dev/null 2>&1; then
+
+    log "Configuring kubectl for ubuntu user"
+
+    mkdir -p /home/ubuntu/.kube
+
+    cp -f /etc/kubernetes/admin.conf \
+        /home/ubuntu/.kube/config
+
+    chown -R ubuntu:ubuntu /home/ubuntu/.kube
+
+    chmod 600 /home/ubuntu/.kube/config
+fi
+
+# -------------------------------------------------------------------
+# Verify Kubernetes API
+# -------------------------------------------------------------------
+
+log "Verifying Kubernetes API"
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    get nodes
+
+# -------------------------------------------------------------------
+# Install Calico CNI
+# -------------------------------------------------------------------
+
+log "Installing Calico $${CALICO_VERSION}"
+
+CALICO_MANIFEST="https://raw.githubusercontent.com/projectcalico/calico/v$${CALICO_VERSION}/manifests/calico.yaml"
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    apply -f "$${CALICO_MANIFEST}"
+
+# -------------------------------------------------------------------
+# Wait for Calico
+# -------------------------------------------------------------------
+
+log "Waiting for Calico components"
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    -n kube-system \
+    rollout status daemonset/calico-node \
+    --timeout=10m
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    -n kube-system \
+    rollout status deployment/calico-kube-controllers \
+    --timeout=10m
+
+# -------------------------------------------------------------------
+# Wait for control-plane node
+# -------------------------------------------------------------------
+
+log "Waiting for control-plane node to become Ready"
+
+CONTROL_PLANE_NODE=$(hostname)
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    wait \
+    --for=condition=Ready \
+    "node/$${CONTROL_PLANE_NODE}" \
+    --timeout=10m
+
+# -------------------------------------------------------------------
+# Verify cluster
+# -------------------------------------------------------------------
+
+log "Verifying Kubernetes cluster"
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    get nodes -o wide
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    get pods -A
+
+# -------------------------------------------------------------------
+# Generate worker join command
+# -------------------------------------------------------------------
+
+log "Generating worker join command"
+
+JOIN_CMD=$(
+    kubeadm token create --print-join-command
+)
+
+[[ -n "$${JOIN_CMD}" ]] \
+    || error "Failed to generate worker join command"
+
+# -------------------------------------------------------------------
+# Verify AWS identity
+# -------------------------------------------------------------------
+
+log "Verifying AWS credentials"
+
+aws sts get-caller-identity \
+    --region "$${AWS_REGION}"
+
+# -------------------------------------------------------------------
+# Publish worker join command to SSM
+# -------------------------------------------------------------------
+
+log "Publishing worker join command to SSM"
+
+aws ssm put-parameter \
+    --region "$${AWS_REGION}" \
+    --name "$${SSM_PATH}" \
+    --value "$${JOIN_CMD}" \
+    --type SecureString \
+    --overwrite
+
+# Verify SSM parameter
+
+log "Verifying SSM parameter"
+
+aws ssm get-parameter \
+    --region "$${AWS_REGION}" \
+    --name "$${SSM_PATH}" \
+    --with-decryption \
+    >/dev/null
+
+# Final cluster verification
+
+log "Final Kubernetes verification"
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    cluster-info
+
+kubectl \
+    --kubeconfig=/etc/kubernetes/admin.conf \
+    get nodes -o wide
+
+# Bootstrap complete
+
+echo "============================================================"
+echo "[bootstrap] Kubernetes control plane bootstrap COMPLETE"
+echo "[bootstrap] Cluster: $${CLUSTER_NAME}"
+echo "[bootstrap] Kubernetes: $${K8S_VERSION}"
+echo "[bootstrap] Calico: $${CALICO_VERSION}"
+echo "[bootstrap] Node IP: $${NODE_IP}"
+echo "[bootstrap] API endpoint: $${API_ENDPOINT}:6443"
+echo "[bootstrap] SSM parameter: $${SSM_PATH}"
+echo "[bootstrap] Completed: $(date)"
+echo "============================================================"

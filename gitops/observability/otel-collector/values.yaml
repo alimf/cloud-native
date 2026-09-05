@@ -1,0 +1,29 @@
+mode: deployment
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  exporters:
+    otlp/tempo:
+      endpoint: tempo.observability.svc.cluster.local:4317
+      tls:
+        insecure: true
+    prometheusremotewrite:
+      endpoint: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090/api/v1/write
+    loki:
+      endpoint: http://loki-gateway.observability.svc.cluster.local/loki/api/v1/push
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        exporters: [otlp/tempo]
+      metrics:
+        receivers: [otlp]
+        exporters: [prometheusremotewrite]
+      logs:
+        receivers: [otlp]
+        exporters: [loki]
