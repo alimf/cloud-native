@@ -21,7 +21,7 @@ set -Eeuo pipefail
 # Logging / error handling
 # -------------------------------------------------------------------
 
-LOG_FILE="/var/log/k8s-control-plane-bootstrap.log"
+LOG_FILE="/var/log/cp-init.log"
 
 exec > >(tee -a "$${LOG_FILE}") 2>&1
 
@@ -141,6 +141,32 @@ log "Primary interface: $${PRIMARY_INTERFACE}"
 log "Node private IP: $${NODE_IP}"
 
 # -------------------------------------------------------------------
+# Network readiness (NAT Gateway route propagation)
+# -------------------------------------------------------------------
+# Protects against the same route-propagation race documented in
+# README-private-subnet-connectivity-fix.md: instances can boot before
+# the NAT Gateway route is actually usable, causing apt/curl timeouts.
+
+log "Waiting for outbound network connectivity..."
+
+NET_READY=false
+for i in $(seq 1 30); do
+    if curl -s --connect-timeout 3 http://1.1.1.1 >/dev/null 2>&1; then
+        log "Network connectivity verified"
+        NET_READY=true
+        break
+    fi
+    log "Network not ready yet, retrying in 5s ($${i}/30)..."
+    sleep 5
+done
+
+[[ "$${NET_READY}" == "true" ]] \
+    || error "No outbound network connectivity after 30 attempts"
+
+# Force IPv4 for APT so it doesn't stall probing unreachable IPv6 sockets.
+echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+
+# -------------------------------------------------------------------
 # System prerequisites
 # -------------------------------------------------------------------
 
@@ -188,18 +214,41 @@ log "Installing required system packages"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update -y
+while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    log "Waiting for concurrent apt/dpkg locks to release..."
+    sleep 5
+done
 
-apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    software-properties-common \
-    conntrack \
-    socat \
-    iptables \
-    awscli
+for i in {1..5}; do
+    apt-get update -y && break
+    log "apt-get update failed, retrying ($i/5)..."
+    sleep 5
+    (( i == 5 )) && error "apt-get update failed after 5 attempts"
+done
+
+for i in {1..5}; do
+    apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        apt-transport-https \
+        ca-certificates \
+        curl \
+        gnupg \
+        software-properties-common \
+        conntrack \
+        socat \
+        iptables \
+        unzip && break
+    log "apt-get install failed, retrying ($i/5)..."
+    sleep 5
+    (( i == 5 )) && error "apt-get install failed after 5 attempts"
+done
+
+ARCH=$(uname -m)  # x86_64 or aarch64
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$${ARCH}.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # -------------------------------------------------------------------
 # Verify AWS CLI
@@ -248,10 +297,19 @@ mkdir -p /etc/containerd
 containerd config default > "$${CONTAINERD_CONFIG}"
 
 # Kubernetes requires systemd cgroups when using kubelet's systemd
-# cgroup driver.
-sed -i \
-    's/SystemdCgroup = false/SystemdCgroup = true/' \
+# cgroup driver. Match is whitespace-tolerant since containerd builds
+# (e.g. Docker's containerd.io package) don't always format the TOML
+# key identically across versions — see
+# README-containerd-systemdcgroup-fix.md.
+sed -i -E \
+    's/(SystemdCgroup[[:space:]]*=[[:space:]]*)false/\1true/' \
     "$${CONTAINERD_CONFIG}"
+
+if ! grep -qE 'SystemdCgroup[[:space:]]*=[[:space:]]*true' "$${CONTAINERD_CONFIG}"; then
+    log "DEBUG: dumping generated containerd config for diagnosis"
+    cat "$${CONTAINERD_CONFIG}"
+    error "Failed to enable SystemdCgroup in containerd config"
+fi
 
 systemctl daemon-reload
 
@@ -267,9 +325,11 @@ log "Verifying containerd"
 systemctl is-active --quiet containerd \
     || error "containerd is not running"
 
-containerd config dump \
-    | grep -q 'SystemdCgroup = true' \
-    || error "containerd SystemdCgroup is not enabled"
+if ! containerd config dump | grep -qE 'SystemdCgroup[[:space:]]*=[[:space:]]*true'; then
+    log "DEBUG: dumping live containerd config for diagnosis"
+    containerd config dump
+    error "containerd SystemdCgroup is not enabled"
+fi
 
 log "containerd is running with systemd cgroups"
 
@@ -450,9 +510,8 @@ log "Installing Calico $${CALICO_VERSION}"
 
 CALICO_MANIFEST="https://raw.githubusercontent.com/projectcalico/calico/v$${CALICO_VERSION}/manifests/calico.yaml"
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    apply -f "$${CALICO_MANIFEST}"
+retry "applying Calico manifest" \
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f "$${CALICO_MANIFEST}"
 
 # -------------------------------------------------------------------
 # Wait for Calico
@@ -507,6 +566,13 @@ kubectl \
 
 log "Generating worker join command"
 
+# NOTE: default kubeadm bootstrap tokens expire after 24h. If workers can
+# join later than that (e.g. ASG scale-out), this token will be stale and
+# joins will fail with no obvious link back to "the token expired". Needs
+# a deliberate choice: `--ttl 0` for a non-expiring token (simpler, but a
+# standing bootstrap credential), or a separate rotation mechanism that
+# reissues the token and updates SSM periodically. Left as-is pending that
+# decision — see review notes.
 JOIN_CMD=$(
     kubeadm token create --print-join-command
 )
@@ -520,8 +586,8 @@ JOIN_CMD=$(
 
 log "Verifying AWS credentials"
 
-aws sts get-caller-identity \
-    --region "$${AWS_REGION}"
+retry "verifying AWS credentials" \
+    aws sts get-caller-identity --region "$${AWS_REGION}"
 
 # -------------------------------------------------------------------
 # Publish worker join command to SSM
@@ -529,22 +595,24 @@ aws sts get-caller-identity \
 
 log "Publishing worker join command to SSM"
 
-aws ssm put-parameter \
-    --region "$${AWS_REGION}" \
-    --name "$${SSM_PATH}" \
-    --value "$${JOIN_CMD}" \
-    --type SecureString \
-    --overwrite
+retry "publishing worker join command to SSM" \
+    aws ssm put-parameter \
+        --region "$${AWS_REGION}" \
+        --name "$${SSM_PATH}" \
+        --value "$${JOIN_CMD}" \
+        --type SecureString \
+        --overwrite
 
 # Verify SSM parameter
 
 log "Verifying SSM parameter"
 
-aws ssm get-parameter \
-    --region "$${AWS_REGION}" \
-    --name "$${SSM_PATH}" \
-    --with-decryption \
-    >/dev/null
+retry "verifying SSM parameter" \
+    aws ssm get-parameter \
+        --region "$${AWS_REGION}" \
+        --name "$${SSM_PATH}" \
+        --with-decryption \
+        --output text
 
 # Final cluster verification
 

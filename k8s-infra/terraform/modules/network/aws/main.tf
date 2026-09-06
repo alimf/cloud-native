@@ -97,14 +97,18 @@ resource "aws_route_table" "private" {
   count  = var.single_nat_gateway ? 1 : local.az_count
   vpc_id = aws_vpc.this.id
 
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this[var.single_nat_gateway ? 0 : count.index].id
-  }
-
   tags = merge(var.tags, {
     Name = "${var.cluster_name}-private-rt-${count.index + 1}"
   })
+}
+
+resource "aws_route" "private_nat_gateway" {
+  count                  = var.single_nat_gateway ? 1 : local.az_count
+  route_table_id         = aws_route_table.private[count.index].id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.this[var.single_nat_gateway ? 0 : count.index].id
+
+  depends_on = [aws_nat_gateway.this]
 }
 
 resource "aws_route_table_association" "private" {

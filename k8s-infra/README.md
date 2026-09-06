@@ -68,7 +68,7 @@ terraform output control_plane_private_ips
 aws ssm start-session --target <instance-id> --region us-east-1
 
 # On the instance
-cat /root/.kube/config
+sudo cat /root/.kube/config
 ```
 
 Copy that kubeconfig locally (e.g. to `~/.kube/config` or `KUBECONFIG=./dev-k8s.conf`), then deploy cluster add-ons with Kustomize:

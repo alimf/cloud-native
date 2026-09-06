@@ -360,7 +360,7 @@ resource "aws_instance" "control_plane" {
     encrypted             = true
   }
 
-  user_data = templatefile("${path.module}/templates/control_plane.sh.tftpl", {
+    user_data_base64 = base64gzip(templatefile("${path.module}/templates/control_plane.sh.tftpl", {
     cluster_name          = var.cluster_name
     kubernetes_version    = var.kubernetes_version
     calico_version        = var.calico_version
@@ -369,7 +369,7 @@ resource "aws_instance" "control_plane" {
     service_cidr          = var.service_cidr
     aws_region            = data.aws_region.current.region
     ssm_join_command_path = local.ssm_join_command_path
-  })
+  }))
 
   tags = merge(var.tags, {
     Name                                        = "${var.cluster_name}-control-plane-${count.index + 1}"
@@ -382,13 +382,28 @@ resource "aws_instance" "control_plane" {
   }
 }
 
+resource "null_resource" "wait_for_control_plane" {
+  depends_on = [aws_instance.control_plane]
+
+  provisioner "local-exec" {
+    command = <<EOT
+      echo "Waiting for K8s control plane SSM join parameter..."
+      until aws ssm get-parameter --name "${local.ssm_join_command_path}" --region "${var.aws_region}" >/dev/null 2>&1; do
+        echo "Parameter not ready yet, retrying in 10s..."
+        sleep 10
+      done
+      echo "SSM join command parameter is ready!"
+    EOT
+  }
+}
+
 # ──────────────────────────────────────────────────────────────
 # Worker EC2 Instances
 # ──────────────────────────────────────────────────────────────
 
 resource "aws_instance" "worker" {
-  count = var.worker_count
-
+  count                  = var.worker_count
+  depends_on             = [null_resource.wait_for_control_plane]
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.worker_instance_type
   subnet_id              = var.private_subnet_ids[count.index % length(var.private_subnet_ids)]

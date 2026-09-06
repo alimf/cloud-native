@@ -1,13 +1,7 @@
 #!/bin/bash
 #
 # Kubernetes Worker Node Bootstrap
-#
 # Rendered by Terraform templatefile().
-#
-# Expected Terraform variables:
-#   kubernetes_version
-#   aws_region
-#   ssm_join_command_path
 
 set -Eeuo pipefail
 
@@ -15,7 +9,7 @@ set -Eeuo pipefail
 # Logging / error handling
 # -------------------------------------------------------------------
 
-LOG_FILE="/var/log/k8s-worker-bootstrap.log"
+LOG_FILE="/var/log/worker-init.log"
 
 exec > >(tee -a "$${LOG_FILE}") 2>&1
 
@@ -26,7 +20,6 @@ echo "[bootstrap] Kubernetes worker bootstrap started"
 echo "[bootstrap] Time: $(date)"
 echo "============================================================"
 
-
 # -------------------------------------------------------------------
 # Terraform-injected variables
 # -------------------------------------------------------------------
@@ -35,94 +28,75 @@ K8S_VERSION="${kubernetes_version}"
 AWS_REGION="${aws_region}"
 SSM_PATH="${ssm_join_command_path}"
 
-
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
-
 CONTAINERD_CONFIG="/etc/containerd/config.toml"
-
 KUBE_APT_KEYRING="/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
 DOCKER_APT_KEYRING="/etc/apt/keyrings/docker.gpg"
 
 MAX_RETRIES=40
 RETRY_INTERVAL=30
 
+log() { echo "[bootstrap] $1"; }
+error() { echo "[bootstrap][ERROR] $1" >&2; exit 1; }
 
 # -------------------------------------------------------------------
-# Helper functions
+# Network Readiness & APT Fixes
 # -------------------------------------------------------------------
 
-log() {
-    echo "[bootstrap] $1"
-}
+log "Force APT to use IPv4 only"
+echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 
-error() {
-    echo "[bootstrap][ERROR] $1" >&2
-    exit 1
-}
+log "Waiting for NAT Gateway internet connectivity..."
+for i in {1..30}; do
+    # Bypasses domain DNS lookup entirely by pinging/curling direct IP
+    if curl -s --connect-timeout 3 http://1.1.1.1 >/dev/null 2>&1 || \
+       curl -s --connect-timeout 3 http://detectportal.firefox.com/success.txt | grep -q "success"; then
+        log "NAT Gateway connectivity verified!"
+        break
+    fi
+    if (( i == 30 )); then
+        error "No outbound IPv4 connectivity through NAT Gateway after 30 attempts"
+    fi
+    log "Network not ready yet, retrying in 5 seconds ($i/30)..."
+    sleep 5
+done
+log "NAT Gateway connectivity established!"
 
 # -------------------------------------------------------------------
 # Validate configuration
 # -------------------------------------------------------------------
 
 log "Validating configuration"
-
-[[ -n "$${K8S_VERSION}" ]] \
-    || error "Kubernetes version is empty"
-
-[[ -n "$${AWS_REGION}" ]] \
-    || error "AWS region is empty"
-
-[[ -n "$${SSM_PATH}" ]] \
-    || error "SSM parameter path is empty"
-
-log "Kubernetes version: $${K8S_VERSION}"
-log "AWS region: $${AWS_REGION}"
-log "SSM parameter: $${SSM_PATH}"
+[[ -n "$${K8S_VERSION}" ]] || error "Kubernetes version is empty"
+[[ -n "$${AWS_REGION}" ]] || error "AWS region is empty"
+[[ -n "$${SSM_PATH}" ]] || error "SSM parameter path is empty"
 
 # -------------------------------------------------------------------
 # Detect primary network interface and private IP
 # -------------------------------------------------------------------
 
 log "Detecting node network configuration"
-
 PRIMARY_INTERFACE=$(ip -4 route show default | awk 'NR==1 {print $5}')
+[[ -n "$${PRIMARY_INTERFACE}" ]] || error "Unable to determine primary network interface"
 
-[[ -n "$${PRIMARY_INTERFACE}" ]] \
-    || error "Unable to determine primary network interface"
-
-NODE_IP=$(
-    ip -4 addr show dev "$${PRIMARY_INTERFACE}" \
-    | awk '/inet / {print $2}' \
-    | cut -d/ -f1 \
-    | head -n1
-)
-
-[[ -n "$${NODE_IP}" ]] \
-    || error "Unable to determine node private IP"
+NODE_IP=$(ip -4 addr show dev "$${PRIMARY_INTERFACE}" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+[[ -n "$${NODE_IP}" ]] || error "Unable to determine node private IP"
 
 log "Primary interface: $${PRIMARY_INTERFACE}"
 log "Node private IP: $${NODE_IP}"
-
 
 # -------------------------------------------------------------------
 # Disable swap
 # -------------------------------------------------------------------
 
 log "Disabling swap"
-
 swapoff -a
-
 sed -i '/[[:space:]]swap[[:space:]]/ s/^[^#]/#&/' /etc/fstab
 
-
 # -------------------------------------------------------------------
-# Kernel modules
+# Kernel modules & sysctl
 # -------------------------------------------------------------------
 
-log "Configuring Kubernetes kernel modules"
-
+log "Configuring Kubernetes kernel modules & sysctl"
 cat > /etc/modules-load.d/k8s.conf <<'MODULES'
 overlay
 br_netfilter
@@ -130,12 +104,6 @@ MODULES
 
 modprobe overlay
 modprobe br_netfilter
-
-# -------------------------------------------------------------------
-# Kernel networking configuration
-# -------------------------------------------------------------------
-
-log "Configuring Kubernetes networking sysctl settings"
 
 cat > /etc/sysctl.d/99-kubernetes.conf <<'SYSCTL'
 net.bridge.bridge-nf-call-iptables  = 1
@@ -146,270 +114,176 @@ SYSCTL
 sysctl --system
 
 # -------------------------------------------------------------------
-# Install system prerequisites
+# Install system prerequisites (Resilient)
 # -------------------------------------------------------------------
 
 log "Installing required system packages"
-
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update -y
+while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    log "Waiting for concurrent apt/dpkg locks to release..."
+    sleep 5
+done
 
-apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    software-properties-common \
-    conntrack \
-    socat \
-    iptables \
-    awscli
+for i in {1..5}; do
+    apt-get update -y && break
+    log "apt-get update failed, retrying ($i/5)..."
+    sleep 5
+    (( i == 5 )) && error "apt-get update failed after 5 attempts"
+done
+
+for i in {1..5}; do
+    apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        apt-transport-https \
+        ca-certificates \
+        curl \
+        gnupg \
+        software-properties-common \
+        conntrack \
+        socat \
+        iptables \
+        unzip && break
+    log "apt-get install failed, retrying ($i/5)..."
+    sleep 5
+done
+
+ARCH=$(uname -m)  # x86_64 or aarch64
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$${ARCH}.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # -------------------------------------------------------------------
-# Verify AWS CLI
+# Verify AWS CLI & Identity
 # -------------------------------------------------------------------
 
-log "Verifying AWS CLI"
-
-command -v aws >/dev/null 2>&1 \
-    || error "AWS CLI is not installed"
-
-aws --version
-
-# -------------------------------------------------------------------
-# Verify AWS credentials / instance role
-# -------------------------------------------------------------------
-
-log "Verifying AWS instance identity"
-
-aws sts get-caller-identity \
-    --region "$${AWS_REGION}"
+log "Verifying AWS CLI and identity"
+command -v aws >/dev/null 2>&1 || error "AWS CLI is not installed"
+aws sts get-caller-identity --region "$${AWS_REGION}"
 
 # -------------------------------------------------------------------
 # Install containerd
 # -------------------------------------------------------------------
 
 log "Installing containerd"
-
 install -m 0755 -d /etc/apt/keyrings
 
-
 if [[ ! -f "$${DOCKER_APT_KEYRING}" ]]; then
-
-    curl -fsSL \
-        https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o "$${DOCKER_APT_KEYRING}"
-
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o "$${DOCKER_APT_KEYRING}"
     chmod a+r "$${DOCKER_APT_KEYRING}"
 fi
 
-
 UBUNTU_CODENAME=$(. /etc/os-release && echo "$${UBUNTU_CODENAME:-$${VERSION_CODENAME}}")
-
 
 cat > /etc/apt/sources.list.d/docker.list <<EOF
 deb [arch=$(dpkg --print-architecture) signed-by=$${DOCKER_APT_KEYRING}] https://download.docker.com/linux/ubuntu $${UBUNTU_CODENAME} stable
 EOF
 
 apt-get update -y
-
 apt-get install -y containerd.io
-
 
 # -------------------------------------------------------------------
 # Configure containerd
 # -------------------------------------------------------------------
 
 log "Configuring containerd"
-
 mkdir -p /etc/containerd
-
 containerd config default > "$${CONTAINERD_CONFIG}"
 
-sed -i \
-    's/SystemdCgroup = false/SystemdCgroup = true/' \
-    "$${CONTAINERD_CONFIG}"
+# Enable SystemdCgroup so kubelet and containerd share the same cgroup driver
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' "$${CONTAINERD_CONFIG}"
 
+if ! grep -q 'SystemdCgroup = true' "$${CONTAINERD_CONFIG}"; then
+    log "DEBUG: dumping generated containerd config for diagnosis"
+    cat "$${CONTAINERD_CONFIG}"
+    error "Failed to enable SystemdCgroup in containerd config"
+fi
 
 systemctl daemon-reload
-
 systemctl enable containerd
-
 systemctl restart containerd
-
-
-# -------------------------------------------------------------------
-# Verify containerd
-# -------------------------------------------------------------------
-
-log "Verifying containerd"
-
-systemctl is-active --quiet containerd \
-    || error "containerd is not running"
-
-containerd config dump \
-    | grep -q 'SystemdCgroup = true' \
-    || error "containerd SystemdCgroup is not enabled"
-
-log "containerd is running with systemd cgroups"
-
+systemctl is-active --quiet containerd || error "containerd is not running"
 
 # -------------------------------------------------------------------
 # Install Kubernetes packages
 # -------------------------------------------------------------------
 
 log "Installing Kubernetes $${K8S_VERSION}"
-
 K8S_MINOR=$(echo "$${K8S_VERSION}" | cut -d. -f1,2)
 
 install -m 0755 -d /etc/apt/keyrings
 
-
 if [[ ! -f "$${KUBE_APT_KEYRING}" ]]; then
-
-    curl -fsSL \
-        "https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/Release.key" \
-        | gpg --dearmor -o "$${KUBE_APT_KEYRING}"
-
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/Release.key" | gpg --dearmor -o "$${KUBE_APT_KEYRING}"
     chmod a+r "$${KUBE_APT_KEYRING}"
 fi
-
 
 cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
 deb [signed-by=$${KUBE_APT_KEYRING}] https://pkgs.k8s.io/core:/stable:/v$${K8S_MINOR}/deb/ /
 EOF
 
 apt-get update -y
-
-apt-get install -y \
-    "kubelet=$${K8S_VERSION}-*" \
-    "kubeadm=$${K8S_VERSION}-*"
-
-
+apt-get install -y "kubelet=$${K8S_VERSION}-*" "kubeadm=$${K8S_VERSION}-*"
 apt-mark hold kubelet kubeadm
-
 systemctl enable kubelet
-
-# -------------------------------------------------------------------
-# Verify Kubernetes binaries
-# -------------------------------------------------------------------
-
-log "Verifying Kubernetes binaries"
-
-kubeadm version
-
-kubelet --version
-
 
 # -------------------------------------------------------------------
 # Configure kubelet node IP
 # -------------------------------------------------------------------
 
 log "Configuring kubelet node IP"
-
 mkdir -p /etc/systemd/system/kubelet.service.d
-
 cat > /etc/systemd/system/kubelet.service.d/20-node-ip.conf <<EOF
 [Service]
 Environment="KUBELET_EXTRA_ARGS=--node-ip=$${NODE_IP}"
 EOF
 
-
 systemctl daemon-reload
-
 systemctl restart kubelet
 
-
 # -------------------------------------------------------------------
-# Prepare SSM join command
+# Retrieve SSM join command and execute
 # -------------------------------------------------------------------
 
 log "Waiting for worker join command in SSM"
-
 JOIN_CMD=""
 
-
-# -------------------------------------------------------------------
-# Wait for SSM parameter
-# -------------------------------------------------------------------
-
 for i in $(seq 1 "$${MAX_RETRIES}"); do
-
     log "Checking SSM parameter (attempt $${i}/$${MAX_RETRIES})"
 
-    if JOIN_CMD=$(
-        aws ssm get-parameter \
+    if JOIN_CMD=$(aws ssm get-parameter \
             --region "$${AWS_REGION}" \
             --name "$${SSM_PATH}" \
             --with-decryption \
             --query 'Parameter.Value' \
-            --output text
-    ); then
+            --output text 2>/dev/null); then
 
         if [[ -n "$${JOIN_CMD}" && "$${JOIN_CMD}" == kubeadm\ join* ]]; then
             log "Valid kubeadm join command retrieved from SSM"
             break
         fi
-
-        log "SSM parameter exists but does not contain a valid kubeadm join command"
-
         JOIN_CMD=""
-    else
-
-        log "Control plane has not published the join command yet"
     fi
-
 
     if (( i == MAX_RETRIES )); then
         error "No valid join command found after $${MAX_RETRIES} attempts"
     fi
 
-
     sleep "$${RETRY_INTERVAL}"
-
 done
 
+if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+    log "Node already joined to cluster, skipping kubeadm join"
+else
+    log "Joining Kubernetes cluster"
+    read -r -a JOIN_ARGS <<< "$${JOIN_CMD}"
+    "$${JOIN_ARGS[@]}"
+fi
 
-# -------------------------------------------------------------------
-# Execute kubeadm join safely
-# -------------------------------------------------------------------
-
-log "Joining Kubernetes cluster"
-
-read -r -a JOIN_ARGS <<< "$${JOIN_CMD}"
-
-"$${JOIN_ARGS[@]}"
-
-
-# -------------------------------------------------------------------
-# Verify kubelet
-# -------------------------------------------------------------------
-
-log "Verifying kubelet"
-
-systemctl is-active --quiet kubelet \
-    || error "kubelet is not running after kubeadm join"
-
-
-# -------------------------------------------------------------------
-# Verify node bootstrap state
-# -------------------------------------------------------------------
-
-log "Checking kubeadm state"
-
-kubeadm reset --help >/dev/null 2>&1 \
-    || error "kubeadm verification failed"
-
-
-# -------------------------------------------------------------------
-# Final status
-# -------------------------------------------------------------------
+systemctl is-active --quiet kubelet || error "kubelet is not running after kubeadm join"
 
 echo "============================================================"
 echo "[bootstrap] Kubernetes worker bootstrap COMPLETE"
-echo "[bootstrap] Kubernetes: $${K8S_VERSION}"
-echo "[bootstrap] Node IP: $${NODE_IP}"
-echo "[bootstrap] SSM parameter: $${SSM_PATH}"
-echo "[bootstrap] Completed: $(date)"
 echo "============================================================"

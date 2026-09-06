@@ -21,6 +21,7 @@ module "network" {
 module "kubernetes" {
   source = "../../../../modules/kubernetes/aws"
 
+  aws_region                  = var.aws_region
   cluster_name                = var.cluster_name
   kubernetes_version          = var.kubernetes_version
   calico_version              = var.calico_version

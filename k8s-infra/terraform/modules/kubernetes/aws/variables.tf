@@ -1,3 +1,8 @@
+variable "aws_region" {
+  description = "AWS region to deploy into"
+  type        = string
+}
+
 variable "cluster_name" {
   description = "Name of the Kubernetes cluster"
   type        = string
