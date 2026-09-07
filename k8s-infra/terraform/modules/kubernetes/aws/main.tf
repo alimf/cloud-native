@@ -382,8 +382,25 @@ resource "aws_instance" "control_plane" {
   }
 }
 
+resource "aws_ssm_parameter" "cp_init_status" {
+  name      = "${local.ssm_join_command_path}_status"
+  type      = "String"
+  value     = "NOT_READY"
+  overwrite = true
+
+  lifecycle {
+    # Recreates this parameter back to "NOT_READY" whenever the control plane instance is replaced
+    replace_triggered_by = [
+      aws_instance.control_plane
+    ]
+
+    # Allows the control plane script to overwrite "NOT_READY" with "READY" without Terraform attempting to revert it
+    ignore_changes = [value]
+  }
+}
+
 resource "null_resource" "wait_for_control_plane" {
-  depends_on = [aws_instance.control_plane]
+  depends_on = [aws_instance.control_plane, aws_ssm_parameter.cp_init_status]
 
   provisioner "local-exec" {
     command = <<EOT
@@ -391,17 +408,17 @@ resource "null_resource" "wait_for_control_plane" {
       MAX_ATTEMPTS=36     # 36 attempts * 10s = 6 Minutes max wait time
       ATTEMPT=1
 
-      echo "Waiting for K8s control plane readiness signal at $STATUS_PATH..."
+      echo "Waiting for control plane readiness signal at $STATUS_PATH"
 
       while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
         STATUS=$(aws ssm get-parameter --name "$STATUS_PATH" --region "${var.aws_region}" --query 'Parameter.Value' --output text 2>/dev/null || echo "NOT_FOUND")
 
         if [ "$STATUS" = "READY" ]; then
-          echo "Control plane API server is confirmed READY! Starting worker deployment..."
+          echo "Control plane is READY! Starting worker nodes provisioning"
           exit 0
         fi
 
-        echo "Control plane not healthy yet (Status: '$STATUS') [Attempt $ATTEMPT/$MAX_ATTEMPTS]"
+        echo "Control plane status: '$STATUS' [Attempt $ATTEMPT/$MAX_ATTEMPTS]"
         sleep 10
         ATTEMPT=$((ATTEMPT + 1))
       done
