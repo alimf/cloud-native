@@ -387,12 +387,27 @@ resource "null_resource" "wait_for_control_plane" {
 
   provisioner "local-exec" {
     command = <<EOT
-      echo "Waiting for K8s control plane SSM join parameter..."
-      until aws ssm get-parameter --name "${local.ssm_join_command_path}" --region "${var.aws_region}" >/dev/null 2>&1; do
-        echo "Parameter not ready yet, retrying in 10s..."
+      STATUS_PATH="${local.ssm_join_command_path}_status"
+      MAX_ATTEMPTS=36     # 36 attempts * 10s = 6 Minutes max wait time
+      ATTEMPT=1
+
+      echo "Waiting for K8s control plane readiness signal at $STATUS_PATH..."
+
+      while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+        STATUS=$(aws ssm get-parameter --name "$STATUS_PATH" --region "${var.aws_region}" --query 'Parameter.Value' --output text 2>/dev/null || echo "NOT_FOUND")
+
+        if [ "$STATUS" = "READY" ]; then
+          echo "Control plane API server is confirmed READY! Starting worker deployment..."
+          exit 0
+        fi
+
+        echo "Control plane not healthy yet (Status: '$STATUS') [Attempt $ATTEMPT/$MAX_ATTEMPTS]"
         sleep 10
+        ATTEMPT=$((ATTEMPT + 1))
       done
-      echo "SSM join command parameter is ready!"
+
+      echo "[ERROR] Timed out waiting for control plane signal at $STATUS_PATH after $((MAX_ATTEMPTS * 10)) seconds." >&2
+      exit 1
     EOT
   }
 }

@@ -9,7 +9,7 @@ set -Eeuo pipefail
 # Logging / error handling
 # -------------------------------------------------------------------
 
-LOG_FILE="/var/log/worker-init.log"
+LOG_FILE="/var/log/init.log"
 
 exec > >(tee -a "$${LOG_FILE}") 2>&1
 

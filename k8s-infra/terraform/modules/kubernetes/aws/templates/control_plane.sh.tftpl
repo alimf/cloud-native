@@ -21,7 +21,7 @@ set -Eeuo pipefail
 # Logging / error handling
 # -------------------------------------------------------------------
 
-LOG_FILE="/var/log/cp-init.log"
+LOG_FILE="/var/log/init.log"
 
 exec > >(tee -a "$${LOG_FILE}") 2>&1
 
@@ -256,8 +256,7 @@ rm -rf /tmp/awscliv2.zip /tmp/aws
 
 log "Verifying AWS CLI"
 
-command -v aws >/dev/null 2>&1 \
-    || error "AWS CLI is not installed"
+command -v aws >/dev/null 2>&1 || error "AWS CLI is not installed"
 
 aws --version
 
@@ -449,8 +448,7 @@ chmod 600 "$${KUBEADM_CONFIG}"
 
 log "Running kubeadm preflight checks"
 
-kubeadm init phase preflight \
-    --config "$${KUBEADM_CONFIG}"
+kubeadm init phase preflight --config "$${KUBEADM_CONFIG}"
 
 # -------------------------------------------------------------------
 # Initialize Kubernetes control plane
@@ -458,9 +456,7 @@ kubeadm init phase preflight \
 
 log "Initializing Kubernetes control plane"
 
-kubeadm init \
-    --config "$${KUBEADM_CONFIG}" \
-    --upload-certs
+kubeadm init --config "$${KUBEADM_CONFIG}" --upload-certs
 
 # -------------------------------------------------------------------
 # Configure kubectl for root
@@ -498,9 +494,7 @@ fi
 
 log "Verifying Kubernetes API"
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    get nodes
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
 
 # -------------------------------------------------------------------
 # Install Calico CNI
@@ -552,13 +546,14 @@ kubectl \
 
 log "Verifying Kubernetes cluster"
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    get nodes -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    get pods -A
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
+
+until kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz' >/dev/null 2>&1; do
+  log "API server /readyz endpoint not ready yet, retrying in 5s..."
+  sleep 5
+done
 
 # -------------------------------------------------------------------
 # Generate worker join command
@@ -577,8 +572,7 @@ JOIN_CMD=$(
     kubeadm token create --print-join-command
 )
 
-[[ -n "$${JOIN_CMD}" ]] \
-    || error "Failed to generate worker join command"
+[[ -n "$${JOIN_CMD}" ]] || error "Failed to generate worker join command"
 
 # -------------------------------------------------------------------
 # Verify AWS identity
@@ -603,8 +597,6 @@ retry "publishing worker join command to SSM" \
         --type SecureString \
         --overwrite
 
-# Verify SSM parameter
-
 log "Verifying SSM parameter"
 
 retry "verifying SSM parameter" \
@@ -614,19 +606,21 @@ retry "verifying SSM parameter" \
         --with-decryption \
         --output text
 
-# Final cluster verification
-
 log "Final Kubernetes verification"
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    cluster-info
+kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
 
-kubectl \
-    --kubeconfig=/etc/kubernetes/admin.conf \
-    get nodes -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
 
-# Bootstrap complete
+SSM_STATUS_PATH="${ssm_join_command_path}_status"
+
+log "Publish Control Plane READY Signal to SSM (LAST STEP)"
+aws ssm put-parameter \
+    --region "$${AWS_REGION}" \
+    --name "$${SSM_STATUS_PATH}" \
+    --value "READY" \
+    --type "String" \
+    --overwrite
 
 echo "============================================================"
 echo "[bootstrap] Kubernetes control plane bootstrap COMPLETE"
